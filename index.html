@@ -23,6 +23,9 @@
         var statusBar = document.getElementById('status-bar');
         var livePusher = null;
         var isPushing = false;
+        var retryCount = 0;
+        var maxRetries = 3;
+        var connectingTimeout = null;
 
         function log(msg) {
             console.log('[H5] ' + msg);
@@ -31,6 +34,104 @@
         function setStatus(msg) {
             statusBar.textContent = msg;
             log('Status: ' + msg);
+        }
+
+        function clearConnectingTimeout() {
+            if (connectingTimeout) {
+                clearTimeout(connectingTimeout);
+                connectingTimeout = null;
+            }
+        }
+
+        function doStartPush(pushUrl) {
+            log('doStartPush called, retryCount: ' + retryCount);
+            
+            if (livePusher) {
+                try {
+                    livePusher.stopPush();
+                } catch (e) {}
+            }
+
+            livePusher.setObserver({
+                onPushStatusUpdate: function(status, message) {
+                    log('Status: ' + status + ', ' + message);
+                    
+                    if (status === 1 || status === 'CONNECTING') {
+                        setStatus('正在连接服务器...');
+                        
+                        clearConnectingTimeout();
+                        connectingTimeout = setTimeout(function() {
+                            if (!isPushing && retryCount < maxRetries) {
+                                log('Connecting timeout, retrying...');
+                                retryCount++;
+                                setStatus('连接超时，重试第 ' + retryCount + ' 次...');
+                                doStartPush(pushUrl);
+                            }
+                        }, 8000);
+                    } else if (status === 3 || status === 'PUSHING') {
+                        clearConnectingTimeout();
+                        isPushing = true;
+                        setStatus('推流中...');
+                        if (window.flutter_inappwebview) {
+                            window.flutter_inappwebview.callHandler('pushStarted');
+                        }
+                    } else if (status === -1 || status === 'ERROR') {
+                        clearConnectingTimeout();
+                        if (retryCount < maxRetries) {
+                            log('Push error, retrying...');
+                            retryCount++;
+                            setStatus('推流错误，重试第 ' + retryCount + ' 次...');
+                            setTimeout(function() {
+                                doStartPush(pushUrl);
+                            }, 2000);
+                        } else {
+                            setStatus('推流错误: ' + message);
+                            if (window.flutter_inappwebview) {
+                                window.flutter_inappwebview.callHandler('pushError', message);
+                            }
+                        }
+                    } else {
+                        clearConnectingTimeout();
+                        setStatus('正在连接服务器...');
+                    }
+                },
+                onError: function(error) {
+                    clearConnectingTimeout();
+                    log('Error: ' + JSON.stringify(error));
+                    if (retryCount < maxRetries) {
+                        log('Observer error, retrying...');
+                        retryCount++;
+                        setStatus('错误，重试第 ' + retryCount + ' 次...');
+                        setTimeout(function() {
+                            doStartPush(pushUrl);
+                        }, 2000);
+                    } else {
+                        setStatus('错误: ' + error.message);
+                        if (window.flutter_inappwebview) {
+                            window.flutter_inappwebview.callHandler('pushError', error.message);
+                        }
+                    }
+                }
+            });
+
+            livePusher.startPush(pushUrl).then(function() {
+                log('startPush returned');
+            }).catch(function(error) {
+                clearConnectingTimeout();
+                log('startPush catch error: ' + error.message);
+                if (retryCount < maxRetries) {
+                    retryCount++;
+                    setStatus('推流失败，重试第 ' + retryCount + ' 次...');
+                    setTimeout(function() {
+                        doStartPush(pushUrl);
+                    }, 2000);
+                } else {
+                    setStatus('推流失败: ' + error.message);
+                    if (window.flutter_inappwebview) {
+                        window.flutter_inappwebview.callHandler('pushError', error.message);
+                    }
+                }
+            });
         }
 
         window.startPush = function() {
@@ -51,6 +152,10 @@
             var pushUrl = window.pushUrl;
             log('Push URL: ' + pushUrl);
 
+            retryCount = 0;
+            isPushing = false;
+            clearConnectingTimeout();
+
             TXLivePusher.checkSupport().then(function(data) {
                 log('Support: ' + JSON.stringify(data));
                 
@@ -64,34 +169,6 @@
                 livePusher.setVideoQuality('480p');
                 livePusher.setAudioQuality('standard');
 
-                livePusher.setObserver({
-                    onPushStatusUpdate: function(status, message) {
-                        log('Status: ' + status + ', ' + message);
-                        
-                        if (status === 3 || status === 'PUSHING') {
-                            isPushing = true;
-                            setStatus('推流中...');
-                            if (window.flutter_inappwebview) {
-                                window.flutter_inappwebview.callHandler('pushStarted');
-                            }
-                        } else if (status === -1 || status === 'ERROR') {
-                            setStatus('推流错误: ' + message);
-                            if (window.flutter_inappwebview) {
-                                window.flutter_inappwebview.callHandler('pushError', message);
-                            }
-                        } else {
-                            setStatus('正在连接服务器...');
-                        }
-                    },
-                    onError: function(error) {
-                        log('Error: ' + JSON.stringify(error));
-                        setStatus('错误: ' + error.message);
-                        if (window.flutter_inappwebview) {
-                            window.flutter_inappwebview.callHandler('pushError', error.message);
-                        }
-                    }
-                });
-
                 return Promise.all([
                     livePusher.startCamera(),
                     livePusher.startMicrophone()
@@ -99,10 +176,7 @@
             })
             .then(function() {
                 log('Camera and microphone started');
-                return livePusher.startPush(pushUrl);
-            })
-            .then(function() {
-                log('startPush returned');
+                doStartPush(pushUrl);
             })
             .catch(function(error) {
                 log('Error: ' + error.message);
@@ -115,6 +189,7 @@
 
         window.stopPush = function() {
             log('stopPush called');
+            clearConnectingTimeout();
             if (livePusher) {
                 livePusher.stopPush();
                 livePusher.stopCamera();
@@ -122,6 +197,7 @@
                 livePusher = null;
             }
             isPushing = false;
+            retryCount = 0;
             setStatus('推流已停止');
         };
 
